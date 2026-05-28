@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple
 from urllib.request import urlopen
 
 import soundfile as sf
+import librosa
 from modelscope import AutoTokenizer
 from tqdm import tqdm
 from omegaconf import DictConfig, OmegaConf, ListConfig
@@ -51,11 +52,13 @@ class LineProcessor:
                 if response.status != 200:
                     return {"error": f"WAV not found: {wav_path}"}
                 audio_file = BytesIO(response.read())
-                duration = sf.info(audio_file).duration
+                # duration = sf.info(audio_file).duration
+                duration = librosa.get_duration(path=wav_path)
             else:
                 if not os.path.exists(wav_path):
                     return {"error": f"WAV not found: {wav_path}"}
-                duration = sf.info(wav_path).duration
+                # duration = sf.info(wav_path).duration
+                duration = librosa.get_duration(path=wav_path)
 
             data = {
                 "messages": [
