@@ -95,7 +95,9 @@ def main_hydra(cfg: DictConfig):
 
     processed_count = 0
     failed_count = 0
+    skipped_count = 0
     error_messages = []
+    skipped_examples = []
 
     with tqdm(total=len(data_pairs), desc="Processing") as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -104,8 +106,13 @@ def main_hydra(cfg: DictConfig):
 
                 for future in as_completed(futures):
                     result = future.result()
+                    idx = futures[future]
 
-                    if result and "success" in result:
+                    if result is None:
+                        # 返回 None 表示该对行被跳过（空行或格式不符合）
+                        skipped_count += 1
+                        skipped_examples.append(idx)
+                    elif result and "success" in result:
                         with processor.lock:
                             json.dump(result["success"], f_out, ensure_ascii=False)
                             f_out.write("\n")
@@ -115,12 +122,13 @@ def main_hydra(cfg: DictConfig):
                         error_messages.append(result["error"])
 
                     pbar.update(1)
-                    pbar.set_postfix({"processed": processed_count, "failed": failed_count})
+                    pbar.set_postfix({"processed": processed_count, "failed": failed_count, "skipped": skipped_count})
 
     print(f"\nProcessing completed:")
     print(f"  Total lines: {len(data_pairs)}")
     print(f"  Successfully processed: {processed_count}")
     print(f"  Failed: {failed_count}")
+    print(f"  Skipped (format/empty): {skipped_count}")
 
     if error_messages and len(error_messages) <= 10:
         print(f"\nSample errors:")
@@ -132,6 +140,11 @@ def main_hydra(cfg: DictConfig):
             print(f"  - {error}")
         print(f"  ... and {len(error_messages) - 10} more errors")
 
+    if skipped_examples:
+        print(f"\nSample skipped line indices (0-based): {skipped_examples[:10]}")
+        print("You can inspect these indices in the scp/transcript files to find formatting issues.")
 
+
+#  eg: python scp2jsonl.py +scp_file='/media/inno/ASR/ChatML/V1/train.scp' +transcript_file='/media/inno/ASR/ChatML/V1/train.txt' +jsonl_file='/media/inno/ASR/ChatML/V1/train.jsonl'
 if __name__ == "__main__":
     main_hydra()
