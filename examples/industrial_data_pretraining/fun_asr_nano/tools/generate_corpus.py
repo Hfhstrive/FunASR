@@ -38,8 +38,8 @@ def corpus_convert(word_path, speech_path, save_path):
 
 if __name__ == '__main__':
     random.seed(20260528)
-    word_path = '/media/inno/ASR/base_data/oral/case_describe/'
-    speech_path = '/media/inno/ASR/audio/train/real/case_describe/'
+    word_path = '/media/inno/ASR/base_data/oral/case/'
+    speech_path = '/media/inno/ASR/audio/train/real/case/'
     save_path = '/media/inno/ASR/ChatML/V3/'
     os.makedirs(save_path, exist_ok=True)
     corpus_convert(word_path, speech_path, save_path)
