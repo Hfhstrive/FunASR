@@ -42,13 +42,13 @@ class LineProcessor:
                 if response.status != 200:
                     return {"error": f"WAV not found: {wav_path}"}
                 audio_file = BytesIO(response.read())
-                # duration = sf.info(audio_file).duration
-                duration = librosa.get_duration(path=wav_path)
+                duration = sf.info(audio_file).duration
+                # duration = librosa.get_duration(path=wav_path)
             else:
                 if not os.path.exists(wav_path):
                     return {"error": f"WAV not found: {wav_path}"}
-                # duration = sf.info(wav_path).duration
-                duration = librosa.get_duration(path=wav_path)
+                duration = sf.info(wav_path).duration
+                # duration = librosa.get_duration(path=wav_path)
 
             data = {
                 "messages": [
