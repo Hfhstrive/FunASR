@@ -242,14 +242,14 @@ def corpus_convert(word_path, speech_path, save_path, split_lines=False, source_
                 with open(save_txt_path, 'a+', encoding='utf-8') as f1:
                     f1.writelines(case_no + ' ' + word_info + '\n')
                     
-                if mode == 'val':
-                    sub_save_dir = os.path.join(save_path, 'val', f"src{source_idx}")
-                    os.makedirs(sub_save_dir, exist_ok=True)
-                    val_save_wav = os.path.join(sub_save_dir, os.path.basename(lesion_speech))
-                    try:
-                        shutil.copy2(lesion_speech, val_save_wav)
-                    except Exception as e:
-                        print(f"[Copy Val] 拷贝失败: {e}")
+                # if mode == 'val':
+                sub_save_dir = os.path.join(save_path, mode, f"src{source_idx}")
+                os.makedirs(sub_save_dir, exist_ok=True)
+                val_save_wav = os.path.join(sub_save_dir, os.path.basename(lesion_speech))
+                try:
+                    shutil.copy2(lesion_speech, val_save_wav)
+                except Exception as e:
+                    print(f"[Copy Val] 拷贝失败: {e}")
                         
                 # 记录映射关系，lesion 是病例文件夹名称（即病例号）
                 case_mapping[case_no] = {
@@ -263,7 +263,7 @@ def corpus_convert(word_path, speech_path, save_path, split_lines=False, source_
 
 if __name__ == '__main__':
     random.seed(20260528)
-    save_path = '/media/inno/ASR/ChatML/V4/'
+    save_path = '/media/inno/ASR/ChatML/V5/'
     os.makedirs(save_path, exist_ok=True)
 
     # # 清理已存在的输出文件以防重复追加
