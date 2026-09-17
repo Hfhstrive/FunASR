@@ -67,6 +67,9 @@ class CharTokenizer(BaseTokenizer):
             Args:
                 line: TODO.
             """
+        if isinstance(line, str) and (len(line.strip()) == 0 or line.strip() in ["<sil>", "!sil", "<blank>"]):
+            return []
+
         if self.seg_dict is not None:
             tokens = line.strip().split(" ")
             tokens = seg_tokenize(tokens, self.seg_dict)
