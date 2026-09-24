@@ -107,10 +107,14 @@ class KwsFrontend:
 
 class OnnxKWSDetector:
     def __init__(self, onnx_path, cmvn_path, keywords="鹰眼鹰眼",
-                 score_thresh=0.6, n_mels=40, lfr_m=7, lfr_n=6,
-                 blank_id=0, unk_id=2601, keyword_len=4):
+                 score_thresh=0.8, min_span=0.40, max_span=1.35, max_gap=0.40, min_token_score=0.65,
+                 n_mels=40, lfr_m=7, lfr_n=6, blank_id=0, unk_id=2601, keyword_len=4):
         self.keywords = keywords
         self.score_thresh = score_thresh
+        self.min_span = min_span
+        self.max_span = max_span
+        self.max_gap = max_gap
+        self.min_token_score = min_token_score
         self.blank_id = blank_id
         self.unk_id = unk_id
         self.keyword_len = keyword_len
@@ -135,6 +139,7 @@ class OnnxKWSDetector:
             self.keyword_ids = [self.unk_id] * self.keyword_len
             print(f"[+] 关键词 '{keywords}' 用 <unk>(id={unk_id}) × {keyword_len} 表示")
         print(f"[+] 目标 token 序列: {self.keyword_ids}")
+        print(f"[+] 时空物理约束已启用: 总时长[{self.min_span:.2f}s~{self.max_span:.2f}s], 最大字间距<={self.max_gap:.2f}s, 单字最低分>={self.min_token_score:.2f}")
 
         self.frontend = KwsFrontend(
             cmvn_path, n_mels=n_mels, lfr_m=lfr_m, lfr_n=lfr_n
@@ -164,36 +169,71 @@ class OnnxKWSDetector:
         # ONNX 导出的输出已经过 Softmax 概率化
         probs = outputs[0][0]  # (T, 2602)
 
-        # ---- CTC greedy 解码 ----
+        # ---- CTC greedy 解码并记录带时间戳与概率的活跃 Token ----
         preds = np.argmax(probs, axis=-1)  # (T,)
-        collapsed = []
-        prev = -1
-        for p in preds:
-            if p != prev:
-                if p != self.blank_id:
-                    collapsed.append(int(p))
-                prev = int(p)
+        active_tokens = []
+        for frame_idx, p in enumerate(preds):
+            if p != self.blank_id:
+                active_tokens.append((frame_idx, int(p), float(probs[frame_idx, p])))
+
+        # 连续相同 token 折叠去重，保留时间戳
+        collapsed_with_time = []
+        for item in active_tokens:
+            if not collapsed_with_time or collapsed_with_time[-1][1] != item[1]:
+                collapsed_with_time.append(item)
+
+        collapsed_ids = [it[1] for it in collapsed_with_time]
 
         if debug:
-            print(f"[DEBUG] 折叠序列: {collapsed}")
+            print(f"[DEBUG] 折叠序列: {collapsed_ids}")
             print(f"[DEBUG] 目标: {self.keyword_ids}")
 
-        # ---- 关键词子序列匹配 ----
+        # ---- 关键词子序列匹配 + 时空物理强约束校验 ----
         kws_ids = self.keyword_ids
         n = len(kws_ids)
-        found = False
-        best_score = 0.0
+        frame_time_step = 0.01 * self.frontend.lfr_n  # 默认 0.01 * 6 = 0.06s (60ms一帧)
 
-        for start in range(len(collapsed) - n + 1):
-            if collapsed[start:start + n] == kws_ids:
-                found = True
-                # 统计匹配 token 的最大置信度
-                match_scores = [float(np.max(probs[:, tid])) for tid in set(kws_ids)]
-                score = float(np.mean(match_scores)) if match_scores else 0.0
-                best_score = max(best_score, score)
+        for start in range(len(collapsed_ids) - n + 1):
+            if collapsed_ids[start : start + n] == kws_ids:
+                sub = collapsed_with_time[start : start + n]
+                frames = [it[0] for it in sub]
+                scores = [it[2] for it in sub]
 
-        if found and best_score >= self.score_thresh:
-            return True, self.keywords, best_score
+                # 约束 1: 音节总时长物理跨度 (4个字人声正常耗时约 0.40s ~ 1.35s)
+                span_sec = (frames[-1] - frames[0]) * frame_time_step
+
+                # 约束 2: 相邻字最大停顿时间 (防止长句中东拼西凑)
+                gaps = [(frames[j + 1] - frames[j]) * frame_time_step for j in range(n - 1)]
+                max_gap_sec = max(gaps) if gaps else 0.0
+
+                # 约束 3: 独立字置信度与平均置信度校验 (防止单个高分拉高均分)
+                min_token_sc = min(scores)
+                avg_sc = float(np.mean(scores))
+
+                if debug:
+                    print(f"[DEBUG 物理约束] 候选 '{self.keywords}': 跨度={span_sec:.2f}s, 最大字间距={max_gap_sec:.2f}s, 单字最低={min_token_sc:.3f}, 均分={avg_sc:.3f}")
+
+                # 物理强约束逐条过滤校验
+                if not (self.min_span <= span_sec <= self.max_span):
+                    if debug:
+                        print(f"[DEBUG 物理约束拒绝] 发音总时长跨度 {span_sec:.2f}s 不在 [{self.min_span:.2f}s, {self.max_span:.2f}s] 区间")
+                    continue
+                if max_gap_sec > self.max_gap:
+                    if debug:
+                        print(f"[DEBUG 物理约束拒绝] 最大字间停顿 {max_gap_sec:.2f}s 超过允许上限 {self.max_gap:.2f}s")
+                    continue
+                if min_token_sc < self.min_token_score:
+                    if debug:
+                        print(f"[DEBUG 物理约束拒绝] 单字最低置信度 {min_token_sc:.3f} 低于门限 {self.min_token_score:.2f}")
+                    continue
+                if avg_sc < self.score_thresh:
+                    if debug:
+                        print(f"[DEBUG 物理约束拒绝] 平均置信度 {avg_sc:.3f} 低于门限 {self.score_thresh:.2f}")
+                    continue
+
+                # 全部物理约束与置信度门限校验通过
+                return True, self.keywords, avg_sc
+
         return False, None, 0.0
 
 
@@ -276,10 +316,46 @@ class KeyboardTrigger:
                 pass
 
 
+def trim_trailing_silence(audio_data: np.ndarray, sample_rate: int = 16000,
+                          silence_thresh: float = 0.015,
+                          safe_margin: float = 0.8,
+                          chunk_ms: int = 40) -> np.ndarray:
+    """
+    智能反向回溯定位真实发音终点，并保留充裕的尾音安全余量 (默认 0.8 秒)。
+
+    原理：
+    从音频尾部倒序向前按 40ms 小窗扫描，检测能量高于弱音门限 (silence_thresh * 0.5) 的真实语音截止位置。
+    从该位置向后追加 safe_margin 秒的安全缓冲静音，多余无用底噪予以切除。
+    彻底避免硬切造成的吞字和尾音截断，同时留出足够的 ASR 空白闭合帧。
+    """
+    if len(audio_data) == 0:
+        return audio_data
+
+    chunk_size = int(sample_rate * (chunk_ms / 1000.0))
+    voice_floor = max(0.008, silence_thresh * 0.8)
+    num_chunks = len(audio_data) // chunk_size
+
+    last_voice_idx = -1
+    for i in range(num_chunks - 1, -1, -1):
+        seg = audio_data[i * chunk_size : (i + 1) * chunk_size]
+        if np.sqrt(np.mean(seg ** 2)) >= voice_floor:
+            last_voice_idx = (i + 1) * chunk_size
+            break
+
+    if last_voice_idx == -1:
+        min_keep = int(sample_rate * 1.0)
+        return audio_data[-min_keep:] if len(audio_data) > min_keep else audio_data
+
+    cutoff = min(len(audio_data), last_voice_idx + int(sample_rate * safe_margin))
+    cutoff = max(int(sample_rate * 0.5), cutoff)
+    cutoff = min(len(audio_data), cutoff)
+    return audio_data[:cutoff]
+
+
 # ==================== 仿真模式 ====================
 
 def run_file_simulation(wav_path, detector, recorder, silence_duration,
-                        debug=False):
+                        debounce_hits=1, safe_margin=0.8, debug=False):
     """无麦克风环境：按 0.1s 切片喂 wav，复用同一套状态机"""
     print(f"\n[*] 仿真模式：{wav_path}")
 
@@ -308,10 +384,11 @@ def run_file_simulation(wav_path, detector, recorder, silence_duration,
     accumulated = 0
     sim_time = 0.0
     wake_count = 0
+    consecutive_hits = 0
     step_samples = int(16000 * 0.1)
     window_samples = int(16000 * 1.8)
 
-    print(f"[*] 音频总时长: {len(data)/16000:.2f}s，开始仿真...")
+    print(f"[*] 音频总时长: {len(data)/16000:.2f}s，开始仿真 (防抖确认: {debounce_hits} 次)...")
 
     for i in range(num_chunks):
         chunk = data[i * chunk_size: (i + 1) * chunk_size]
@@ -333,13 +410,18 @@ def run_file_simulation(wav_path, detector, recorder, silence_duration,
                 accumulated = 0
                 detected, kw, score = detector.detect(kws_buffer, debug=debug)
                 if detected:
-                    wake_count += 1
-                    print(f"\n[{sim_time:.2f}s] 🎉 第 {wake_count} 次唤醒 "
-                          f"'{kw}' (置信度: {score:.4f})")
-                    state = "RECORDING"
-                    recorded_frames = []
-                    last_voice_time = sim_time
-                    kws_buffer = np.zeros(0, dtype=np.float32)
+                    consecutive_hits += 1
+                    if consecutive_hits >= debounce_hits:
+                        wake_count += 1
+                        print(f"\n[{sim_time:.2f}s] 🎉 第 {wake_count} 次唤醒 "
+                              f"'{kw}' (置信度: {score:.4f}, 防抖: {consecutive_hits}/{debounce_hits})")
+                        state = "RECORDING"
+                        recorded_frames = []
+                        last_voice_time = sim_time
+                        kws_buffer = np.zeros(0, dtype=np.float32)
+                        consecutive_hits = 0
+                else:
+                    consecutive_hits = 0
 
         elif state == "RECORDING":
             recorded_frames.append(chunk)
@@ -350,22 +432,35 @@ def run_file_simulation(wav_path, detector, recorder, silence_duration,
                 if elapsed >= silence_duration:
                     print(f"\n[{sim_time:.2f}s] ⏹️ 静音 {silence_duration}s，结束录音")
                     total = np.concatenate(recorded_frames)
+                    save_audio = trim_trailing_silence(
+                        total,
+                        sample_rate=16000,
+                        silence_thresh=recorder.silence_thresh,
+                        safe_margin=safe_margin
+                    )
                     ts = time.strftime("%Y%m%d_%H%M%S")
                     fname = f"{ts}.wav"
                     fpath = os.path.join(recorder.save_dir, fname)
-                    sf.write(fpath, total, 16000)
-                    print(f"💾 已保存: {fpath} ({len(total)/16000:.2f}s)")
+                    sf.write(fpath, save_audio, 16000)
+                    print(f"💾 已保存: {fpath} ({len(save_audio)/16000:.2f}s，含 {safe_margin}s 尾音安全余量)")
                     state = "LISTENING"
                     kws_buffer = np.zeros(0, dtype=np.float32)
                     recorded_frames = []
+                    consecutive_hits = 0
 
     if state == "RECORDING" and recorded_frames:
         print(f"\n[{sim_time:.2f}s] ℹ️ 音频流结束，结算录音...")
         total = np.concatenate(recorded_frames)
+        save_audio = trim_trailing_silence(
+            total,
+            sample_rate=16000,
+            silence_thresh=recorder.silence_thresh,
+            safe_margin=safe_margin
+        )
         ts = time.strftime("%Y%m%d_%H%M%S")
         fpath = os.path.join(recorder.save_dir, f"{ts}.wav")
-        sf.write(fpath, total, 16000)
-        print(f"💾 已保存: {fpath} ({len(total)/16000:.2f}s)")
+        sf.write(fpath, save_audio, 16000)
+        print(f"💾 已保存: {fpath} ({len(save_audio)/16000:.2f}s)")
 
     print(f"\n[*] 仿真结束，共检测到 {wake_count} 次唤醒。")
 
@@ -378,6 +473,7 @@ def run_realtime(args, detector, recorder, keyboard_trigger, debug=False):
     recorded_frames = []
     last_voice_time = 0.0
     accumulated = 0
+    consecutive_hits = 0
     step_samples = int(16000 * 0.1)
     window_samples = int(16000 * 1.8)
 
@@ -400,6 +496,7 @@ def run_realtime(args, detector, recorder, keyboard_trigger, debug=False):
                         recorded_frames = []
                         last_voice_time = time.time()
                         kws_buffer = np.zeros(0, dtype=np.float32)
+                        consecutive_hits = 0
                     continue
 
                 chunk_rms = np.sqrt(np.mean(chunk ** 2))
@@ -412,6 +509,7 @@ def run_realtime(args, detector, recorder, keyboard_trigger, debug=False):
                         recorded_frames = []
                         last_voice_time = time.time()
                         kws_buffer = np.zeros(0, dtype=np.float32)
+                        consecutive_hits = 0
                         continue
 
                     kws_buffer = np.concatenate([kws_buffer, chunk])
@@ -425,12 +523,17 @@ def run_realtime(args, detector, recorder, keyboard_trigger, debug=False):
                             kws_buffer, debug=debug
                         )
                         if detected:
-                            print(f"\n🎉 [唤醒] '{kw}' (置信度: {score:.4f})")
-                            print("🔴 [录音中] 静音 3 秒自动停止...")
-                            state = "RECORDING"
-                            recorded_frames = []
-                            last_voice_time = time.time()
-                            kws_buffer = np.zeros(0, dtype=np.float32)
+                            consecutive_hits += 1
+                            if consecutive_hits >= args.debounce_hits:
+                                print(f"\n🎉 [唤醒] '{kw}' (置信度: {score:.4f}, 防抖: {consecutive_hits}/{args.debounce_hits})")
+                                print("🔴 [录音中] 静音 3 秒自动停止...")
+                                state = "RECORDING"
+                                recorded_frames = []
+                                last_voice_time = time.time()
+                                kws_buffer = np.zeros(0, dtype=np.float32)
+                                consecutive_hits = 0
+                        else:
+                            consecutive_hits = 0
 
                 elif state == "RECORDING":
                     recorded_frames.append(chunk)
@@ -454,13 +557,13 @@ def run_realtime(args, detector, recorder, keyboard_trigger, debug=False):
                             print("\n\n⏹️  [录音结束]")
                             total = np.concatenate(recorded_frames)
 
-                            trim = int(16000 * max(
-                                0, recorder.silence_duration - 0.5
-                            ))
-                            if len(total) > trim + 8000:
-                                save_audio = total[:-trim]
-                            else:
-                                save_audio = total
+                            # 智能反向回溯定位真实语音终点，并保留 safe_margin (默认 0.8s) 安全尾音
+                            save_audio = trim_trailing_silence(
+                                total,
+                                sample_rate=16000,
+                                silence_thresh=recorder.silence_thresh,
+                                safe_margin=args.safe_margin
+                            )
 
                             ts = time.strftime("%Y%m%d_%H%M%S")
                             fname = f"{ts}.wav"
@@ -468,12 +571,13 @@ def run_realtime(args, detector, recorder, keyboard_trigger, debug=False):
                             sf.write(fpath, save_audio, 16000)
 
                             dur = len(save_audio) / 16000
-                            print(f"💾 已保存: {fpath} ({dur:.2f}s)")
+                            print(f"💾 已保存: {fpath} ({dur:.2f}s，含 {args.safe_margin}s 安全尾音缓冲)")
 
                             state = "LISTENING"
                             kws_buffer = np.zeros(0, dtype=np.float32)
                             recorded_frames = []
                             accumulated = 0
+                            consecutive_hits = 0
                             print(f"\n👂 [监听中] 请说出 "
                                   f"'{args.keywords}' 或按 S 键...")
 
@@ -495,6 +599,10 @@ def run(args):
         cmvn_path=args.cmvn_path,
         keywords=args.keywords,
         score_thresh=args.score_thresh,
+        min_span=args.min_span,
+        max_span=args.max_span,
+        max_gap=args.max_gap,
+        min_token_score=args.min_token_score,
         n_mels=args.n_mels,
         lfr_m=args.lfr_m,
         lfr_n=args.lfr_n,
@@ -515,7 +623,8 @@ def run(args):
     if args.test_wav:
         run_file_simulation(
             args.test_wav, detector, recorder,
-            args.silence_duration, debug=args.debug
+            args.silence_duration, debounce_hits=args.debounce_hits,
+            safe_margin=args.safe_margin, debug=args.debug
         )
         return
 
@@ -530,8 +639,11 @@ def run(args):
     keyboard_trigger.start()
 
     print("\n" + "=" * 60)
-    print("  ONNX KWS 监听系统已就绪（无 funasr 依赖）")
-    print(f"  • 唤醒词       : {args.keywords} (编码: <unk>×{args.keyword_len})")
+    print("  ONNX KWS 监听系统已就绪（无 funasr 依赖 + 时空物理强约束）")
+    print(f"  • 唤醒词       : {args.keywords}")
+    print(f"  • 置信度阈值   : {args.score_thresh} (单字最低门限: {args.min_token_score})")
+    print(f"  • 时空物理约束 : 4字时长[{args.min_span}s~{args.max_span}s], 最大字间停顿<={args.max_gap}s, 防抖确认={args.debounce_hits}次")
+    print(f"  • 尾音安全保护 : 保留 {args.safe_margin} 秒弱音余量 (双阈值迟滞 + 智能反向回溯，绝不截断尾音)")
     print(f"  • 手动按键     : {'S' if args.enable_hotkey else '未启用'}")
     print(f"  • 静音停止     : {args.silence_duration}s")
     print(f"  • 保存目录     : {os.path.abspath(args.save_dir)}")
@@ -543,16 +655,27 @@ def run(args):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="ONNX KWS 唤醒词监听与录音（无 funasr 依赖）"
+        description="ONNX KWS 唤醒词监听与录音（无 funasr 依赖 + 时空物理强约束）"
     )
     p.add_argument("--onnx_model", type=str,
-                   default="/media/inno/work_dirs/ASR/kws_yingyan/onnx/encoder.onnx",
+                   default="/media/inno/work_dirs/ASR/KWS/kws_yingyan_v3/onnx/encoder_quant.onnx",
                    help="encoder.onnx 路径")
     p.add_argument("--cmvn_path", type=str,
-                   default="/media/inno/work_dirs/ASR/kws_yingyan/am.mvn.dim40_l3r3",
+                   default="/media/inno/work_dirs/ASR/KWS/kws_yingyan_v3/am.mvn.dim40_l3r3",
                    help="am.mvn.dim40_l3r3 路径")
     p.add_argument("--keywords", type=str, default="鹰眼鹰眼")
-    p.add_argument("--score_thresh", type=float, default=0.6)
+    p.add_argument("--score_thresh", type=float, default=0.8,
+                   help="平均置信度门限 (默认: 0.8)")
+    p.add_argument("--min_token_score", type=float, default=0.65,
+                   help="每个音节独立最低置信度门限 (默认: 0.65)")
+    p.add_argument("--min_span", type=float, default=0.40,
+                   help="4字最短发音总时长秒数 (默认: 0.40s)")
+    p.add_argument("--max_span", type=float, default=1.35,
+                   help="4字最长发音总时长秒数 (默认: 1.35s)")
+    p.add_argument("--max_gap", type=float, default=0.50,
+                   help="相邻音节间最大允许停顿秒数 (默认: 0.50s)")
+    p.add_argument("--debounce_hits", type=int, default=1,
+                   help="防抖连续命中次数确认 (默认: 1，极嘈杂环境可设为 2)")
     p.add_argument("--n_mels", type=int, default=40)
     p.add_argument("--lfr_m", type=int, default=7)
     p.add_argument("--lfr_n", type=int, default=6)
@@ -563,15 +686,15 @@ def parse_args():
     p.add_argument("--keyword_len", type=int, default=4,
                    help="关键词对应的 token 数（鹰眼鹰眼=4）")
     p.add_argument("--silence_duration", type=float, default=3.0)
+    p.add_argument("--safe_margin", type=float, default=0.8,
+                   help="真实语音截止后保留的尾音安全余量秒数 (默认: 0.8s)")
     p.add_argument("--silence_thresh", type=float, default=0.015)
     p.add_argument("--auto_calibrate", action="store_true")
-    p.add_argument("--save_dir", type=str, default="/media/inno/output/ASR/唤醒词/唤醒词验证/onnx/")
+    p.add_argument("--save_dir", type=str, default="/media/inno/output/ASR/唤醒词/v3/onnx/")
     p.add_argument("--mic_index", type=int, default=None)
     p.add_argument("--enable_hotkey", action="store_true")
     p.add_argument("--hotkey", type=str, default="s")
-    # p.add_argument("--test_wav", type=str, default=None,
-    # p.add_argument("--test_wav", type=str, default="/media/inno/ASR/kws_root/test/唤醒词-鹰眼鹰眼.wav",
-    p.add_argument("--test_wav", type=str, default="/media/inno/ASR/唤醒词/数据集/阴性/肠镜/66_70.wav",
+    p.add_argument("--test_wav", type=str, default="/media/inno/ASR/KWS/test/唤醒词-鹰眼鹰眼.wav",
                    help="仿真模式：传入 wav 路径；不传则走实时麦克风")
     p.add_argument("--debug", action="store_true",
                    help="打印 CTC 解码调试信息")
