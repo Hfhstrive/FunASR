@@ -1,17 +1,19 @@
 # Copyright FunASR (https://github.com/alibaba-damo-academy/FunASR). All Rights Reserved.
 #  MIT License  (https://opensource.org/licenses/MIT)
 
-config_path="/home/pengteng.spt/source/FunASR_KWS/examples/industrial_data_pretraining/sanm_kws_streaming/conf"
-config_path="/home/pengteng.spt/source/FunASR_KWS/examples/industrial_data_pretraining/sanm_kws_streaming/exp/20240618_xiaoyun_finetune_sanm_6e_320_256_feats_dim40_char_t2602_online_6"
-
-config_file="sanm_6e_320_256_fdim40_t2602.yaml"
+# 1. 指向微调产出目录中实际保存的完整 config.yaml (包含词表与 CMVN 路径)
+config_path="/media/inno/work_dirs/ASR/KWS/kws_yingyan_v3"
 config_file="config.yaml"
 
-model_path="./modelscope_models_kws/speech_charctc_kws_phone-xiaoyun/funasr/finetune_sanm_6e_320_256_fdim40_t2602_online_xiaoyun_commands.pt"
+# 2. 权重路径与导出目录
+model_path="/media/inno/work_dirs/ASR/KWS/kws_yingyan_v3/model.pt.best"
+output_dir="/media/inno/work_dirs/ASR/KWS/kws_yingyan_v3/onnx/"
 
 python -m funasr.bin.export \
     --config-path="${config_path}" \
     --config-name="${config_file}" \
     ++init_param=${model_path} \
     ++type="onnx" \
-    ++quantize=true
+    ++output_dir="${output_dir}" \
+    ++opset_version=14 \
+    ++quantize=True
